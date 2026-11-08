@@ -1,0 +1,123 @@
+name: Auto-Setup & Build Linella Order PRO APK
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch: # Ручной запуск сборки кнопкой "Run workflow" во вкладке Actions
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  setup-and-compile-apk:
+    name: Run Setup Script & Build Android APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: 1. Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: 2. Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 3. Setup Java JDK 21 (Required for Capacitor 6 & Gradle 8+)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: 4. Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: 5. Cache Gradle & NPM
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.npm
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-build-cache-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-build-cache-
+
+      - name: 6. Run Auto-Generator Script (setup-and-build.mjs)
+        run: |
+          if [ -f "setup-and-build.mjs" ]; then
+            echo "Запуск автосборщика setup-and-build.mjs..."
+            node setup-and-build.mjs
+          else
+            echo "Файл setup-and-build.mjs не найден, используем существующую структуру репозитория."
+          fi
+
+      - name: 7. Install NPM Dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: 8. Run Unit Tests (Vitest)
+        run: |
+          if [ -d "tests" ]; then
+            npm test
+          fi
+
+      - name: 9. Build Production Web Bundle (Vite)
+        run: npm run build
+
+      - name: 10. Generate & Sync Capacitor Android Platform
+        run: |
+          if [ ! -d "android" ]; then
+            npx cap add android
+          fi
+          npx cap sync android
+
+      - name: 11. Patch AndroidManifest.xml & Gradle Properties for Large Excel Files
+        run: |
+          MANIFEST="android/app/src/main/AndroidManifest.xml"
+          if [ -f "$MANIFEST" ]; then
+            if ! grep -q "android:largeHeap" "$MANIFEST"; then
+              sed -i 's/<application/<application android:largeHeap="true" android:usesCleartextTraffic="true"/g' "$MANIFEST"
+            fi
+          fi
+          echo "" >> android/gradle.properties
+          echo "org.gradle.jvmargs=-Xmx4096m -Dfile.encoding=UTF-8" >> android/gradle.properties
+          echo "android.useAndroidX=true" >> android/gradle.properties
+
+      - name: 12. Compile Debug APK via Gradle
+        working-directory: ./android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: 13. Prepare Named APK File
+        run: |
+          BUILD_DATE=$(date +'%Y-%m-%d')
+          APK_SRC="android/app/build/outputs/apk/debug/app-debug.apk"
+          APK_OUT="android/app/build/outputs/apk/debug/Linella-Order-PRO-v1.0.${{ github.run_number }}-${BUILD_DATE}.apk"
+          cp "$APK_SRC" "$APK_OUT"
+          echo "APK_FILE=$APK_OUT" >> $GITHUB_ENV
+          echo "ARTIFACT_NAME=Linella-Order-PRO-v1.0.${{ github.run_number }}-${BUILD_DATE}" >> $GITHUB_ENV
+
+      - name: 14. Upload Ready APK to GitHub Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ env.APK_FILE }}
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: 15. Auto-Publish to GitHub Releases (Optional on Tag v*)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.APK_FILE }}
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
